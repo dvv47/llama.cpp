@@ -519,9 +519,6 @@ static bool tcp_recv_impl(socket_t * sock, void * data, size_t size) {
 
 #ifdef GGML_RPC_RDMA
 
-static bool rdma_send_impl(socket_t * sock, const void * data, size_t size);
-static bool rdma_recv_impl(socket_t * sock, void * data, size_t size);
-
 static inline bool tcp_peer_closed(int fd) {
     if (fd < 0) return false;
 #ifndef _WIN32
@@ -619,14 +616,6 @@ static bool rdma_recv(rdma_conn * c, void * data, size_t size, int tcp_fd = -1) 
         rem -= got;
     }
     return true;
-}
-
-static bool rdma_send_impl(socket_t * sock, const void * data, size_t size) {
-    return rdma_send(sock->rdma, data, size, sock->fd);
-}
-
-static bool rdma_recv_impl(socket_t * sock, void * data, size_t size) {
-    return rdma_recv(sock->rdma, data, size, sock->fd);
 }
 
 // Phase 1: Probe for RDMA device, create QP (in RESET state), return local info.
@@ -810,6 +799,198 @@ static bool rdma_activate(rdma_conn * c, const rdma_local_info * local,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// RDMA RPC-level transport: message-oriented (replaces byte-stream dispatch)
+//
+// Instead of channeling every send_data/recv_data call through RDMA (one RDMA
+// op per call), these functions operate at the RPC command level:
+//   - A full request  [1B cmd][8B size][payload] is sent as 1-2 RDMA ops
+//   - A full response [8B size][payload]         is sent as 1-2 RDMA ops
+// This reduces a typical request-response cycle from 5 RDMA ops to 2.
+// ---------------------------------------------------------------------------
+
+// Forward declaration of socket_t (defined above, outside the RDMA guard)
+struct socket_t;
+
+static constexpr size_t RPC_HDR_CMD_SIZE = 1 + sizeof(uint64_t); // 9 bytes: cmd(1) + size(8)
+static constexpr size_t RPC_HDR_RSP_SIZE = sizeof(uint64_t);      // 8 bytes: size(8)
+
+// Send a contiguous buffer from tx_buf as a single RDMA SEND.
+// Caller must have already placed data in c->tx_buf.
+static bool rdma_send_buf(rdma_conn * c, size_t len, int tcp_fd) {
+    struct ibv_sge sge = {};
+    struct ibv_send_wr wr = {}, * bad = nullptr;
+    wr.opcode  = IBV_WR_SEND;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    if (len <= c->max_inline) {
+        sge.addr   = (uintptr_t)c->tx_buf;
+        sge.length = len;
+        wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+    } else {
+        sge.addr   = (uintptr_t)c->tx_buf;
+        sge.length = len;
+        sge.lkey   = c->tx_mr->lkey;
+        wr.send_flags = IBV_SEND_SIGNALED;
+    }
+
+    if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
+    struct ibv_wc wc;
+    return rdma_poll(c->scq, &wc, tcp_fd);
+}
+
+// Receive one RDMA message and return a view into the rx_slot.
+// Caller must call c->post_rx(slot) after it is done reading from the pointer.
+// Returns actual bytes received, or -1 on error. Sets *slot_out and *data_out.
+static ssize_t rdma_recv_slot(rdma_conn * c, int * slot_out, const void ** data_out, int tcp_fd) {
+    struct ibv_wc wc;
+    if (!rdma_poll(c->rcq, &wc, tcp_fd)) return -1;
+
+    *slot_out = (int)wc.wr_id;
+    *data_out = c->rx_slot(*slot_out);
+    return (ssize_t)wc.byte_len;
+}
+
+// Client: send a full RPC request [1B cmd][8B size][payload] in minimal RDMA ops.
+static bool rdma_send_rpc_cmd(socket_t * sock, uint8_t cmd, const void * input, size_t input_size) {
+    rdma_conn * c = sock->rdma;
+    int tcp_fd = sock->fd;
+    size_t total = RPC_HDR_CMD_SIZE + input_size;
+
+    if (total <= RDMA_CHUNK) {
+        // Entire request fits in one RDMA send
+        uint8_t * buf = (uint8_t *)c->tx_buf;
+        buf[0] = cmd;
+        memcpy(buf + 1, &input_size, sizeof(input_size));
+        if (input_size > 0) {
+            memcpy(buf + RPC_HDR_CMD_SIZE, input, input_size);
+        }
+        return rdma_send_buf(c, total, tcp_fd);
+    }
+
+    // Large payload: first chunk has header + start of payload
+    {
+        uint8_t * buf = (uint8_t *)c->tx_buf;
+        buf[0] = cmd;
+        memcpy(buf + 1, &input_size, sizeof(input_size));
+        size_t first_payload = RDMA_CHUNK - RPC_HDR_CMD_SIZE;
+        memcpy(buf + RPC_HDR_CMD_SIZE, input, first_payload);
+        if (!rdma_send_buf(c, RDMA_CHUNK, tcp_fd)) return false;
+
+        // Stream remaining payload using rdma_send
+        return rdma_send(c, (const uint8_t *)input + first_payload,
+                         input_size - first_payload, tcp_fd);
+    }
+}
+
+// Client: receive a full RPC response [8B size][payload] in minimal RDMA ops.
+// Validates that response size matches expected output_size.
+static bool rdma_recv_rpc_response(socket_t * sock, void * output, size_t output_size) {
+    rdma_conn * c = sock->rdma;
+    int tcp_fd = sock->fd;
+
+    // Receive first chunk — read directly from rx_slot, no intermediate buffer
+    int slot;
+    const void * rx_raw;
+    ssize_t got = rdma_recv_slot(c, &slot, &rx_raw, tcp_fd);
+    if (got < (ssize_t)RPC_HDR_RSP_SIZE) {
+        if (got >= 0) c->post_rx(slot);
+        return false;
+    }
+
+    const uint8_t * rx = (const uint8_t *)rx_raw;
+    uint64_t out_size;
+    memcpy(&out_size, rx, sizeof(out_size));
+    if (out_size != output_size) {
+        c->post_rx(slot);
+        return false;
+    }
+
+    // Copy payload directly from rx_slot to output
+    size_t first_payload = std::min((size_t)got - RPC_HDR_RSP_SIZE, output_size);
+    if (first_payload > 0 && output != nullptr) {
+        memcpy(output, rx + RPC_HDR_RSP_SIZE, first_payload);
+    }
+    c->post_rx(slot);
+
+    if (output_size <= first_payload) return true;
+
+    // More data to receive
+    return rdma_recv(c, (uint8_t *)output + first_payload,
+                     output_size - first_payload, tcp_fd);
+}
+
+// Server: receive a full RPC request [1B cmd][8B size][payload] in minimal RDMA ops.
+static bool rdma_recv_rpc_request(socket_t * sock, uint8_t * cmd, std::vector<uint8_t> & payload) {
+    rdma_conn * c = sock->rdma;
+    int tcp_fd = sock->fd;
+
+    // Receive first chunk — read directly from rx_slot, no intermediate buffer
+    int slot;
+    const void * rx_raw;
+    ssize_t got = rdma_recv_slot(c, &slot, &rx_raw, tcp_fd);
+    if (got < (ssize_t)RPC_HDR_CMD_SIZE) {
+        if (got >= 0) c->post_rx(slot);
+        return false;
+    }
+
+    const uint8_t * rx = (const uint8_t *)rx_raw;
+    *cmd = rx[0];
+    uint64_t payload_size;
+    memcpy(&payload_size, rx + 1, sizeof(payload_size));
+
+    try {
+        payload.resize(payload_size);
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR("RDMA: failed to allocate payload of size %" PRIu64 "\n", payload_size);
+        c->post_rx(slot);
+        return false;
+    }
+
+    // Copy payload directly from rx_slot to vector
+    size_t first_payload = std::min((size_t)(got - RPC_HDR_CMD_SIZE), (size_t)payload_size);
+    if (first_payload > 0) {
+        memcpy(payload.data(), rx + RPC_HDR_CMD_SIZE, first_payload);
+    }
+    c->post_rx(slot);
+
+    if (payload_size <= first_payload) return true;
+
+    // More data to receive
+    return rdma_recv(c, payload.data() + first_payload,
+                     payload_size - first_payload, tcp_fd);
+}
+
+// Server: send a full RPC response [8B size][payload] in minimal RDMA ops.
+static bool rdma_send_rpc_response(socket_t * sock, const void * data, size_t data_size) {
+    rdma_conn * c = sock->rdma;
+    int tcp_fd = sock->fd;
+    uint64_t size_val = data_size;
+    size_t total = RPC_HDR_RSP_SIZE + data_size;
+
+    if (total <= RDMA_CHUNK) {
+        uint8_t * buf = (uint8_t *)c->tx_buf;
+        memcpy(buf, &size_val, sizeof(size_val));
+        if (data_size > 0 && data != nullptr) {
+            memcpy(buf + RPC_HDR_RSP_SIZE, data, data_size);
+        }
+        return rdma_send_buf(c, total, tcp_fd);
+    }
+
+    // Large response: first chunk has size + start of data
+    {
+        uint8_t * buf = (uint8_t *)c->tx_buf;
+        memcpy(buf, &size_val, sizeof(size_val));
+        size_t first_data = RDMA_CHUNK - RPC_HDR_RSP_SIZE;
+        memcpy(buf + RPC_HDR_RSP_SIZE, data, first_data);
+        if (!rdma_send_buf(c, RDMA_CHUNK, tcp_fd)) return false;
+
+        return rdma_send(c, (const uint8_t *)data + first_data,
+                         data_size - first_data, tcp_fd);
+    }
+}
+
 #endif // GGML_RPC_RDMA
 
 // unified transport dispatch (via function pointers)
@@ -854,6 +1035,28 @@ static bool recv_msg(socket_t * sock, std::vector<uint8_t> & input) {
     return recv_data(sock, input.data(), size);
 }
 
+// Transport-agnostic RPC framing: receives [cmd + payload] or sends [size + payload]
+// using RDMA message-level ops when available, TCP byte-stream otherwise.
+
+static bool recv_rpc_request(socket_t * sock, uint8_t * cmd, std::vector<uint8_t> & payload) {
+#ifdef GGML_RPC_RDMA
+    if (sock->rdma) {
+        return rdma_recv_rpc_request(sock, cmd, payload);
+    }
+#endif
+    if (!recv_data(sock, cmd, 1)) return false;
+    return recv_msg(sock, payload);
+}
+
+static bool send_rpc_response(socket_t * sock, const void * data, size_t size) {
+#ifdef GGML_RPC_RDMA
+    if (sock->rdma) {
+        return rdma_send_rpc_response(sock, data, size);
+    }
+#endif
+    return send_msg(sock, data, size);
+}
+
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
     size_t pos = endpoint.find(':');
     if (pos == std::string::npos) {
@@ -871,6 +1074,11 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+#ifdef GGML_RPC_RDMA
+    if (sock->rdma) {
+        return rdma_send_rpc_cmd(sock.get(), (uint8_t)cmd, input, input_size);
+    }
+#endif
     uint8_t cmd_byte = cmd;
     if (!send_data(sock.get(), &cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -887,6 +1095,12 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+#ifdef GGML_RPC_RDMA
+    if (sock->rdma) {
+        if (!rdma_send_rpc_cmd(sock.get(), (uint8_t)cmd, input, input_size)) return false;
+        return rdma_recv_rpc_response(sock.get(), output, output_size);
+    }
+#endif
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
@@ -939,8 +1153,6 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
             if (rsp.rdma_qpn != 0) {
                 if (rdma_activate(probe.get(), &local_info, rsp.rdma_qpn, rsp.rdma_psn, rsp.rdma_gid)) {
                     sock->rdma = probe.release();
-                    sock->fn_send = rdma_send_impl;
-                    sock->fn_recv = rdma_recv_impl;
                     return true;
                 }
                 GGML_LOG_ERROR("RDMA activate failed, staying on TCP\n");
@@ -2102,8 +2314,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         if (probe && rsp.rdma_qpn != 0) {
             if (rdma_activate(probe.get(), &local_info, req.rdma_qpn, req.rdma_psn, req.rdma_gid)) {
                 sockfd->rdma = probe.release();
-                sockfd->fn_send = rdma_send_impl;
-                sockfd->fn_recv = rdma_recv_impl;
             } else {
                 GGML_LOG_ERROR("RDMA activate failed on server, staying on TCP\n");
             }
@@ -2123,223 +2333,129 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         }
     }
     while (true) {
-        if (!recv_data(sockfd, &cmd, 1)) {
+        std::vector<uint8_t> payload;
+        if (!recv_rpc_request(sockfd, &cmd, payload)) {
             break;
         }
         if (cmd >= RPC_CMD_COUNT) {
-            // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
         switch (cmd) {
             case RPC_CMD_HELLO: {
-                // HELLO command is handled above
-                return;
+                return; // HELLO is handled above
             }
             case RPC_CMD_DEVICE_COUNT: {
-                if (!recv_msg(sockfd, nullptr, 0)) {
-                    return;
-                }
                 rpc_msg_device_count_rsp response;
                 response.device_count = backends.size();
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_ALLOC_BUFFER: {
-                rpc_msg_alloc_buffer_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_alloc_buffer_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_alloc_buffer_req *>(payload.data());
                 rpc_msg_alloc_buffer_rsp response;
-                if (!server.alloc_buffer(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.alloc_buffer(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_GET_ALLOC_SIZE: {
-                rpc_msg_get_alloc_size_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_get_alloc_size_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_get_alloc_size_req *>(payload.data());
                 rpc_msg_get_alloc_size_rsp response;
-                if (!server.get_alloc_size(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.get_alloc_size(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_GET_ALIGNMENT: {
-                rpc_msg_get_alignment_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_get_alignment_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_get_alignment_req *>(payload.data());
                 rpc_msg_get_alignment_rsp response;
-                if (!server.get_alignment(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.get_alignment(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_GET_MAX_SIZE: {
-                rpc_msg_get_max_size_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_get_max_size_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_get_max_size_req *>(payload.data());
                 rpc_msg_get_max_size_rsp response;
-                if (!server.get_max_size(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.get_max_size(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_BUFFER_GET_BASE: {
-                rpc_msg_buffer_get_base_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_buffer_get_base_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_buffer_get_base_req *>(payload.data());
                 rpc_msg_buffer_get_base_rsp response;
-                if (!server.buffer_get_base(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.buffer_get_base(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_FREE_BUFFER: {
-                rpc_msg_free_buffer_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
-                if (!server.free_buffer(request)) {
-                    return;
-                }
-                if (!send_msg(sockfd, nullptr, 0)) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_free_buffer_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_free_buffer_req *>(payload.data());
+                if (!server.free_buffer(request)) return;
+                if (!send_rpc_response(sockfd, nullptr, 0)) return;
                 break;
             }
             case RPC_CMD_BUFFER_CLEAR: {
-                rpc_msg_buffer_clear_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
-                if (!server.buffer_clear(request)) {
-                    return;
-                }
-                if (!send_msg(sockfd, nullptr, 0)) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_buffer_clear_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_buffer_clear_req *>(payload.data());
+                if (!server.buffer_clear(request)) return;
+                if (!send_rpc_response(sockfd, nullptr, 0)) return;
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sockfd, input)) {
-                    return;
-                }
-                if (!server.set_tensor(input)) {
-                    return;
-                }
+                if (!server.set_tensor(payload)) return;
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
-                rpc_msg_set_tensor_hash_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_set_tensor_hash_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_set_tensor_hash_req *>(payload.data());
                 rpc_msg_set_tensor_hash_rsp response;
-                if (!server.set_tensor_hash(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.set_tensor_hash(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_INIT_TENSOR: {
-                rpc_msg_init_tensor_req request;
-                if (!recv_msg(sockfd, &request,sizeof(request))) {
-                    return;
-                }
-                if (!server.init_tensor(request)) {
-                    return;
-                }
-                if (!send_msg(sockfd, nullptr, 0)) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_init_tensor_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_init_tensor_req *>(payload.data());
+                if (!server.init_tensor(request)) return;
+                if (!send_rpc_response(sockfd, nullptr, 0)) return;
                 break;
             }
             case RPC_CMD_GET_TENSOR: {
-                rpc_msg_get_tensor_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_get_tensor_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_get_tensor_req *>(payload.data());
                 std::vector<uint8_t> response;
-                if (!server.get_tensor(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, response.data(), response.size())) {
-                    return;
-                }
+                if (!server.get_tensor(request, response)) return;
+                if (!send_rpc_response(sockfd, response.data(), response.size())) return;
                 break;
             }
             case RPC_CMD_COPY_TENSOR: {
-                rpc_msg_copy_tensor_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_copy_tensor_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_copy_tensor_req *>(payload.data());
                 rpc_msg_copy_tensor_rsp response;
-                if (!server.copy_tensor(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.copy_tensor(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_GRAPH_COMPUTE: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sockfd, input)) {
-                    return;
-                }
-                if (!server.graph_compute(input)) {
-                    return;
-                }
+                if (!server.graph_compute(payload)) return;
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
-                rpc_msg_graph_recompute_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
-                if (!server.graph_recompute(request)) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_graph_recompute_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_graph_recompute_req *>(payload.data());
+                if (!server.graph_recompute(request)) return;
                 break;
             }
             case RPC_CMD_GET_DEVICE_MEMORY: {
-                rpc_msg_get_device_memory_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
-                    return;
-                }
+                if (payload.size() != sizeof(rpc_msg_get_device_memory_req)) return;
+                const auto & request = *reinterpret_cast<const rpc_msg_get_device_memory_req *>(payload.data());
                 rpc_msg_get_device_memory_rsp response;
-                if (!server.get_device_memory(request, response)) {
-                    return;
-                }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.get_device_memory(request, response)) return;
+                if (!send_rpc_response(sockfd, &response, sizeof(response))) return;
                 break;
             }
             default: {

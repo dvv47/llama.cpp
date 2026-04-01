@@ -1366,8 +1366,9 @@ struct test {
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
+    double                   t_model_load_ms;
 
-    test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
+    test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx, double model_load_ms = 0.0) :
         cpu_info(get_cpu_info()),
         gpu_info(get_gpu_info()) {
 
@@ -1406,6 +1407,8 @@ struct test {
         time_t t       = time(NULL);
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
         test_time = buf;
+
+        t_model_load_ms = model_load_ms;
 
         (void) ctx;
     }
@@ -1448,18 +1451,35 @@ struct test {
         return backends.empty() ? "CPU" : join(backends, ",");
     }
 
+    static bool report_load_time() {
+        static int cached = -1;
+        if (cached < 0) {
+            const char * env = getenv("LLAMA_BENCH_LOAD_TIME");
+            cached = (env && (std::string(env) == "1" || std::string(env) == "true")) ? 1 : 0;
+        }
+        return cached == 1;
+    }
+
     static const std::vector<std::string> & get_fields() {
-        static const std::vector<std::string> fields = {
-            "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
-            "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
-            "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
-            "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
-        };
-        return fields;
+        static std::vector<std::string> fields_with_load;
+        static std::vector<std::string> fields_without_load;
+        static bool inited = false;
+        if (!inited) {
+            fields_without_load = {
+                "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
+                "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
+                "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
+                "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+                "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+                "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
+                "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
+                "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            };
+            fields_with_load = fields_without_load;
+            fields_with_load.push_back("t_model_load_ms");
+            inited = true;
+        }
+        return report_load_time() ? fields_with_load : fields_without_load;
     }
 
     enum field_type { STRING, BOOL, INT, FLOAT };
@@ -1475,7 +1495,7 @@ struct test {
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "t_model_load_ms") {
             return FLOAT;
         }
         return STRING;
@@ -1557,6 +1577,9 @@ struct test {
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
                                             std::to_string(stdev_ts()) };
+        if (report_load_time()) {
+            values.push_back(std::to_string(t_model_load_ms));
+        }
         return values;
     }
 
@@ -1743,6 +1766,9 @@ struct markdown_printer : public printer {
         if (field == "no_host") {
             return 4;
         }
+        if (field == "t_model_load_ms") {
+            return 12;
+        }
 
         int width = std::max((int) field.length(), 10);
 
@@ -1791,6 +1817,9 @@ struct markdown_printer : public printer {
         }
         if (field == "tensor_buft_overrides") {
             return "ot";
+        }
+        if (field == "t_model_load_ms") {
+            return "load_ms";
         }
         return field;
     }
@@ -1872,6 +1901,9 @@ struct markdown_printer : public printer {
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
+        if (test::report_load_time()) {
+            fields.emplace_back("t_model_load_ms");
+        }
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
@@ -1926,6 +1958,9 @@ struct markdown_printer : public printer {
                 value = buf;
             } else if (field == "t/s") {
                 snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
+                value = buf;
+            } else if (field == "t_model_load_ms") {
+                snprintf(buf, sizeof(buf), "%.0f", t.t_model_load_ms);
                 value = buf;
             } else if (vmap.find(field) != vmap.end()) {
                 value = vmap.at(field);
@@ -2129,6 +2164,7 @@ int main(int argc, char ** argv) {
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
+    double                      last_model_load_ms = 0.0;
 
     // store the llama_context state at the previous depth that we performed a test
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
@@ -2147,7 +2183,9 @@ int main(int argc, char ** argv) {
                 llama_model_free(lmodel);
             }
 
+            uint64_t t_load_start = get_time_ns();
             lmodel = llama_model_load_from_file(inst.model.c_str(), inst.to_llama_mparams());
+            last_model_load_ms = (get_time_ns() - t_load_start) / 1e6;
             if (lmodel == NULL) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
                 return 1;
@@ -2162,7 +2200,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        test t(inst, lmodel, ctx);
+        test t(inst, lmodel, ctx, last_model_load_ms);
 
         llama_memory_clear(llama_get_memory(ctx), false);
 
